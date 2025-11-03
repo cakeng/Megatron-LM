@@ -2120,6 +2120,7 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
+        print(f"Warmup step {i} of {num_warmup_microbatches}")
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -2174,6 +2175,8 @@ def forward_backward_pipelining_without_interleaving(
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
+
+        print(f"1F1B step {i} of {num_microbatches_remaining}")
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -2242,7 +2245,7 @@ def forward_backward_pipelining_without_interleaving(
     # Run cooldown backward passes.
     if not forward_only:
         for i in range(num_warmup_microbatches):
-
+            print(f"Cooldown step {i} of {num_warmup_microbatches}")
             # Enable async grad reduction in the last backward pass
             # Note: If grad sync function is provided, only enable
             # async grad reduction in first pipeline stage. Other
