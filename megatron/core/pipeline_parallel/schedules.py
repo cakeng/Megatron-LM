@@ -4,6 +4,7 @@ import contextlib
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
+from mpmath.libmp.backend import exec_
 import torch
 from torch.autograd.variable import Variable
 
@@ -1953,6 +1954,7 @@ def get_tensor_shapes(
     tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
     return tensor_shapes
 
+
 class _PassThrough(Function):
     @staticmethod
     def forward(ctx, x):
@@ -1965,26 +1967,35 @@ class _PassThrough(Function):
         return grad_output
 class ContextSwitchModule(nn.Module):
     def __init__(self, force_switch: bool = False, 
-                 do_fwd: bool = True, do_bwd: bool = True):
+                 do_fwd: bool = True, do_bwd: bool = True,
+                 tag: str = None):
         super().__init__()
         self.force_switch = force_switch
         self.do_fwd = do_fwd
         self.do_bwd = do_bwd
-
+        self.tag = tag
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Ensures a grad_fn exists even if this would be a pure identity
         # return x
         return _PassThrough.apply(x)
 
 class forward_execution_engine(threading.Thread):
-    def __init__(self):
+    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag):
         super().__init__()
+        self.context_scheduler = context_scheduler
+        self.exec_engine_idx = exec_engine_idx
+        self.microbatch_idx = microbatch_idx
+        self.tag = tag
+        self.next_op = None
+
+        self.signal = threading.Event()
+        self.cuda_event = torch.cuda.Event()
 
     def set_args(self, p2p_communicator, recv_tensor_shapes, forward_step_func, 
                  data_iterator, model, num_microbatches, forward_data_store, 
                  config, pg_collection, collect_non_loss_data, checkpoint_activations_microbatch, 
                  first_val_step, microbatch_id, is_pp_last_stage, forward_only,
-                 input_tensors, output_tensors, device):
+                 input_tensors, output_tensors, total_num_tokens, device):
         self.p2p_communicator = p2p_communicator
         self.recv_tensor_shapes = recv_tensor_shapes
         self.forward_step_func = forward_step_func
@@ -2002,16 +2013,18 @@ class forward_execution_engine(threading.Thread):
         self.forward_only = forward_only
         self.input_tensors = input_tensors
         self.output_tensors = output_tensors
+        self.total_num_tokens = total_num_tokens
         self.device = device
-
-        self.outputs = None
+        self.dummy_tensor = torch.zeros(1, dtype=torch.float32, device=torch.cuda.current_device())
+        
 
     def run(self):
         torch.cuda.set_device(self.device)
-        print(f"Forward of microbatch {self.microbatch_id} Started")
+        self.context_scheduler.enter_context(self.exec_engine_idx, "recv")
         input_tensor = self.p2p_communicator.recv_forward(
             self.recv_tensor_shapes, is_pp_first_stage(self.p2p_communicator.pp_group)
         )
+        self.context_scheduler.context_switch(self.exec_engine_idx, "comp")
         output_tensor, num_tokens = forward_step(
             self.forward_step_func,
             self.data_iterator,
@@ -2028,14 +2041,15 @@ class forward_execution_engine(threading.Thread):
             current_microbatch=self.microbatch_id,
             is_last_stage=self.is_pp_last_stage(self.p2p_communicator.pp_group),
         )
+        self.context_scheduler.context_switch(self.exec_engine_idx, "send")
         self.p2p_communicator.send_forward(output_tensor, self.is_pp_last_stage(self.p2p_communicator.pp_group))
     
         self.input_tensors[self.microbatch_id] = input_tensor
         self.output_tensors[self.microbatch_id] = output_tensor
         deallocate_output_tensor(output_tensor[0], self.config.deallocate_pipeline_outputs)
 
-        self.outputs = num_tokens
-        print(f"Forward of microbatch {self.microbatch_id} Finished")
+        self.total_num_tokens += num_tokens
+        self.context_scheduler.exit_context(self.exec_engine_idx)
 
     def start(self):
         super().start()
@@ -2047,9 +2061,17 @@ class forward_execution_engine(threading.Thread):
         return super().is_alive()
 
 class backward_execution_engine(threading.Thread):
-    def __init__(self):
+    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag):
         super().__init__()
+        self.context_scheduler = context_scheduler
+        self.exec_engine_idx = exec_engine_idx
+        self.microbatch_idx = microbatch_idx
+        self.tag = tag
+        self.next_op = None
 
+        self.signal = threading.Event()
+        self.cuda_event = torch.cuda.Event()
+        
     def set_args(self, input_tensors, output_tensors, microbatch_id, num_microbatches, 
                  send_tensor_shapes, p2p_communicator, enable_grad_sync,
                  model_type, config, rank, device):
@@ -2065,10 +2087,9 @@ class backward_execution_engine(threading.Thread):
         self.rank = rank
         self.device = device
         
-
     def run(self):
         torch.cuda.set_device(self.device)
-        print(f"Backward of microbatch {self.microbatch_id} Started")
+        self.context_scheduler.enter_context(self.exec_engine_idx, "recv")
         if self.microbatch_id == self.num_microbatches - 1:
             if self.config.grad_sync_func is None or self.rank == 0:
                 self.enable_grad_sync()
@@ -2079,17 +2100,17 @@ class backward_execution_engine(threading.Thread):
         output_tensor_grad = self.p2p_communicator.recv_backward(
             self.send_tensor_shapes, is_pp_last_stage(self.p2p_communicator.pp_group)
         )
-
+        self.context_scheduler.context_switch(self.exec_engine_idx, "comp")
         input_tensor_grad = backward_step(
             input_tensor, output_tensor, output_tensor_grad, self.model_type, self.config
         )
-
+        self.context_scheduler.context_switch(self.exec_engine_idx, "send")
         self.p2p_communicator.send_backward(
             input_tensor_grad, is_pp_first_stage(self.p2p_communicator.pp_group)
         )
-        print(f"Backward of microbatch {self.microbatch_id} Finished")
         self.input_tensors[self.microbatch_id] = None
         self.output_tensors[self.microbatch_id] = None
+        self.context_scheduler.exit_context(self.exec_engine_idx)
 
     def start(self):
         super().start()
@@ -2100,6 +2121,131 @@ class backward_execution_engine(threading.Thread):
     def is_alive(self):
         return super().is_alive()
 
+def generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_microbatches):
+    order = []
+    exec_engine_idx = 0
+    microbatch_queue = []
+    for i in range(num_warmup_microbatches):
+        microbatch_idx = i
+        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Forward"))
+        exec_engine_idx += 1
+        microbatch_queue.append(microbatch_idx)
+    for i in range(num_microbatches - num_warmup_microbatches):
+        microbatch_idx = i + num_warmup_microbatches
+        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Forward"))
+        exec_engine_idx += 1
+        microbatch_queue.append(microbatch_idx)
+        microbatch_idx = microbatch_queue.pop(0)
+        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Backward"))
+        exec_engine_idx += 1
+    for i in range(num_warmup_microbatches):
+        microbatch_idx = microbatch_queue.pop(0)
+        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Backward"))
+        exec_engine_idx += 1
+    assert len(microbatch_queue) == 0, "Microbatch queue should be empty"
+    total_order_str = ""
+    for o in order:
+        total_order_str += f"{o.tag} {o.microbatch_idx}, "
+    print(f"Total order 1F1B: {total_order_str}")
+    context_scheduler.set_execs(order)
+    return order
+
+def generate_total_order_v(context_scheduler, num_microbatches):
+    order = []
+    exec_engine_idx = 0
+    microbatch_queue = []
+    for i in range(num_microbatches):
+        microbatch_idx = i
+        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Forward"))
+        exec_engine_idx += 1
+        microbatch_queue.append(microbatch_idx)
+        microbatch_idx = microbatch_queue.pop(0)
+        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Backward"))
+        exec_engine_idx += 1
+    assert len(microbatch_queue) == 0, "Microbatch queue should be empty"
+    total_order_str = ""
+    for o in order:
+        total_order_str += f"{o.tag} {o.microbatch_idx}, "
+    print(f"Total order V: {total_order_str}")
+    context_scheduler.set_execs(order)
+    return order
+
+class ContextScheduler:
+    """ Manages and schedules forward and backward execution engines. """
+    def __init__(self, device, pp_rank):
+        self.device = device
+        self.pp_rank = pp_rank
+        self.execs = None
+
+        torch.cuda.set_device(self.device)
+        self.comp_stream = torch.cuda.Stream(device)
+        self.comm_stream = torch.cuda.Stream(device)
+        self.mem_stream = torch.cuda.Stream(device)
+
+        self.debug = True
+
+    def set_execs(self, execs):
+        self.execs = execs
+
+    def schedule(self):
+        next_exec_id = None
+        if self.debug:
+            schedule_str = ""
+            for exec in self.execs:
+                schedule_str += f"{exec.exec_engine_idx} ({exec.tag} {exec.microbatch_idx}) - {exec.next_op}, "
+            print(f"[Scheduler] Current Schedule: {schedule_str}")
+        for exec in self.execs:
+            if exec.next_op is not None:
+                next_exec_id = exec.exec_engine_idx
+                break
+        if next_exec_id is not None:
+            self.execs[next_exec_id].signal.set()
+            self.execs[next_exec_id].next_op = "Running"
+            if self.debug:
+                print(f"[Scheduler] Setting next exec to {next_exec_id}")
+
+
+    def enter_context(self, exec_id, next_op):
+        exec = self.execs[exec_id]
+        if self.debug:
+            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Entering context with next op {next_op}")
+        exec.signal.clear()
+        exec.next_op = next_op
+        exec.signal.wait()
+        if self.debug:
+            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Entered context")
+
+    def exit_context(self, exec_id):
+        exec = self.execs[exec_id]
+        if self.debug:
+            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Exiting context")
+        exec.signal.clear()
+        exec.next_op = None
+        self.schedule()
+        if self.debug:
+            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Released context")
+
+    def context_switch(self, exec_id, next_op):
+        exec = self.execs[exec_id]
+        if self.debug:
+            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Releasing context")
+        exec.signal.clear()
+        exec.next_op = next_op
+        self.schedule()
+        exec.signal.wait()
+        if self.debug:
+            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Acquiring context")
+
+    def start(self):
+        for exec in self.execs:
+            exec.start()
+        if self.debug:
+            print(f"[Scheduler] Starting scheduler")
+        self.schedule()
+
+    def join(self):
+        for exec in self.execs:
+            exec.join()
 
 def forward_backward_pipelining_without_interleaving(
     *,
@@ -2227,8 +2373,7 @@ def forward_backward_pipelining_without_interleaving(
         p2p_communicator.pp_group.size() - p2p_communicator.pp_group.rank() - 1
     )
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
-    num_microbatches_remaining = num_microbatches - num_warmup_microbatches
-
+    
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
     # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
@@ -2267,49 +2412,43 @@ def forward_backward_pipelining_without_interleaving(
 
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
+    device = next(model.parameters()).device
+    context_scheduler = ContextScheduler(device, p2p_communicator.pp_group.rank())
+    # generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_microbatches)
+    generate_total_order_v(context_scheduler, num_microbatches)
+
     input_tensors = {}
     output_tensors = {}
     forward_data_store = {}
 
-    current_fwd = 0
-
-    forward_engines = []
-    backward_engines = []
     for i in range(num_microbatches):
-        forward_engines.append(forward_execution_engine())
-        backward_engines.append(backward_execution_engine())
         forward_data_store[i] = []
 
-    # Run warmup forward passes.
-    for microbatch_id in range(num_microbatches):
-        print(f"Executing microbatch {microbatch_id} of {num_microbatches}")
+    for exec in context_scheduler.execs:
+        microbatch_idx = exec.microbatch_idx
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
-                i % max_outstanding_backprops
+                microbatch_idx % max_outstanding_backprops
                 >= config.num_microbatches_with_partial_activation_checkpoints
             )
         else:
             checkpoint_activations_microbatch = None
 
-        device = next(model.parameters()).device
+        if exec.tag == "Forward":
+            exec.set_args(p2p_communicator, recv_tensor_shapes, forward_step_func, 
+                    data_iterator, model, num_microbatches, forward_data_store[microbatch_idx], config, pg_collection, 
+                    collect_non_loss_data, checkpoint_activations_microbatch, first_val_step, microbatch_idx, 
+                    is_pp_last_stage, forward_only, input_tensors, output_tensors, total_num_tokens, device)
+        else:
+            exec.set_args(input_tensors, output_tensors, microbatch_idx,
+                    num_microbatches, send_tensor_shapes, p2p_communicator, enable_grad_sync, 
+                    model_type, config, rank, device)
 
-        forward_engines[microbatch_id].set_args(p2p_communicator, recv_tensor_shapes, forward_step_func, 
-                data_iterator, model, num_microbatches, forward_data_store[microbatch_id], config, pg_collection, 
-                collect_non_loss_data, checkpoint_activations_microbatch, first_val_step, microbatch_id, 
-                is_pp_last_stage, forward_only, input_tensors, output_tensors, device)
-        forward_engines[microbatch_id].start()
-        forward_engines[microbatch_id].join()
-        num_tokens = forward_engines[microbatch_id].outputs
+    # Run scheduler
+    context_scheduler.start()
+    context_scheduler.join()
 
-        total_num_tokens += num_tokens
-
-        backward_engines[microbatch_id].set_args(input_tensors, output_tensors, microbatch_id,
-                num_microbatches, send_tensor_shapes, p2p_communicator, enable_grad_sync, 
-                model_type, config, rank, device)
-        backward_engines[microbatch_id].start()
-        backward_engines[microbatch_id].join()
- 
         # Launch any remaining grad reductions.
     if no_sync_context is not None:
         enable_grad_sync()
