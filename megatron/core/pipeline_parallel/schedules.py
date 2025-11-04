@@ -1980,13 +1980,15 @@ class ContextSwitchModule(nn.Module):
         return _PassThrough.apply(x)
 
 class forward_execution_engine(threading.Thread):
-    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag):
+    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag, recv_key=-1, send_key=-1):
         super().__init__()
         self.context_scheduler = context_scheduler
         self.exec_engine_idx = exec_engine_idx
         self.microbatch_idx = microbatch_idx
         self.tag = tag
         self.next_op = None
+        self.recv_key = recv_key
+        self.send_key = send_key
 
         self.signal = threading.Event()
         self.cuda_event = torch.cuda.Event()
@@ -2061,14 +2063,16 @@ class forward_execution_engine(threading.Thread):
         return super().is_alive()
 
 class backward_execution_engine(threading.Thread):
-    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag):
+    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag, recv_key=-1, send_key=-1):
         super().__init__()
         self.context_scheduler = context_scheduler
         self.exec_engine_idx = exec_engine_idx
         self.microbatch_idx = microbatch_idx
         self.tag = tag
         self.next_op = None
-
+        self.recv_key = recv_key
+        self.send_key = send_key
+        
         self.signal = threading.Event()
         self.cuda_event = torch.cuda.Event()
         
@@ -2121,31 +2125,96 @@ class backward_execution_engine(threading.Thread):
     def is_alive(self):
         return super().is_alive()
 
-def generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_microbatches):
+def calculate_1f1b_comm_keys(pp_rank, pp_size, num_microbatches) -> int:
+    order_key = 0
+    total_order_keys = []
+    for n in range(num_microbatches):
+        total_order_keys.append({"fwd_recv_key": -1, "fwd_send_key": -1, 
+                                    "bwd_recv_key": -1, "bwd_send_key": -1})
+    for n in range(num_microbatches + pp_size * 2):
+        if pp_rank % 2 == 0:
+            fwr_mb = n - pp_rank
+            do_fwr_mb = fwr_mb >= 0 and fwr_mb < num_microbatches
+            bwr_mb = n - pp_size * 2 + pp_rank + 1
+            do_bwr_mb = bwr_mb >= 0 and bwr_mb < num_microbatches
+            bws_mb = n - pp_size * 2 + pp_rank
+            do_bws_mb = bws_mb >= 0 and bws_mb < num_microbatches
+            fws_mb = n - pp_rank - 1
+            do_fws_mb = fws_mb >= 0 and fws_mb < num_microbatches
+
+            if do_fwr_mb:
+                total_order_keys[fwr_mb]["fwd_recv_key"] = order_key
+                order_key += 1
+            if do_fws_mb:
+                total_order_keys[fws_mb]["fwd_send_key"] = order_key
+                order_key += 1
+            if do_bwr_mb:
+                total_order_keys[bwr_mb]["bwd_recv_key"] = order_key
+                order_key += 1
+            if do_bws_mb:
+                total_order_keys[bws_mb]["bwd_send_key"] = order_key
+                order_key += 1
+        else:
+            fws_mb = n - pp_rank - 1
+            do_fws_mb = fws_mb >= 0 and fws_mb < num_microbatches
+            bws_mb = n - pp_size * 2 + pp_rank
+            do_bws_mb = bws_mb >= 0 and bws_mb < num_microbatches
+            bwr_mb = n - pp_size * 2 + pp_rank + 1
+            do_bwr_mb = bwr_mb >= 0 and bwr_mb < num_microbatches
+            fwr_mb = n - pp_rank
+            do_fwr_mb = fwr_mb >= 0 and fwr_mb < num_microbatches
+            
+            if do_fws_mb:
+                total_order_keys[fws_mb]["fwd_send_key"] = order_key
+                order_key += 1
+            if do_fwr_mb:
+                total_order_keys[fwr_mb]["fwd_recv_key"] = order_key
+                order_key += 1
+            if do_bws_mb:
+                total_order_keys[bws_mb]["bwd_send_key"] = order_key
+                order_key += 1
+            if do_bwr_mb:
+                total_order_keys[bwr_mb]["bwd_recv_key"] = order_key
+                order_key += 1
+    return total_order_keys
+
+def generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_microbatches, 
+                              pp_rank, pp_size):
     order = []
     exec_engine_idx = 0
+    comm_keys = calculate_1f1b_comm_keys(pp_rank, pp_size, num_microbatches)
     microbatch_queue = []
     for i in range(num_warmup_microbatches):
         microbatch_idx = i
-        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Forward"))
+        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, 
+                                              f"Forward", comm_keys[microbatch_idx]["fwd_recv_key"], 
+                                              comm_keys[microbatch_idx]["fwd_send_key"]))
         exec_engine_idx += 1
         microbatch_queue.append(microbatch_idx)
     for i in range(num_microbatches - num_warmup_microbatches):
-        microbatch_idx = i + num_warmup_microbatches
-        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Forward"))
+        fwd_microbatch_idx = i + num_warmup_microbatches
+        microbatch_queue.append(fwd_microbatch_idx)
+        bwd_microbatch_idx = microbatch_queue.pop(0)
+        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, fwd_microbatch_idx, 
+                                              f"Forward", comm_keys[fwd_microbatch_idx]["fwd_recv_key"], 
+                                              comm_keys[fwd_microbatch_idx]["fwd_send_key"]))
         exec_engine_idx += 1
-        microbatch_queue.append(microbatch_idx)
-        microbatch_idx = microbatch_queue.pop(0)
-        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Backward"))
+        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, bwd_microbatch_idx, 
+                                               f"Backward", comm_keys[bwd_microbatch_idx]["bwd_recv_key"], 
+                                               comm_keys[bwd_microbatch_idx]["bwd_send_key"]))
         exec_engine_idx += 1
     for i in range(num_warmup_microbatches):
         microbatch_idx = microbatch_queue.pop(0)
-        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Backward"))
+        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, 
+                                               f"Backward", comm_keys[microbatch_idx]["bwd_recv_key"], 
+                                               comm_keys[microbatch_idx]["bwd_send_key"]))
         exec_engine_idx += 1
+
+
     assert len(microbatch_queue) == 0, "Microbatch queue should be empty"
     total_order_str = ""
     for o in order:
-        total_order_str += f"{o.tag} {o.microbatch_idx}, "
+        total_order_str += f"{o.tag} {o.microbatch_idx} ({o.recv_key}, {o.send_key}), "
     print(f"Total order 1F1B: {total_order_str}")
     context_scheduler.set_execs(order)
     return order
@@ -2153,19 +2222,24 @@ def generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_mi
 def generate_total_order_v(context_scheduler, num_microbatches):
     order = []
     exec_engine_idx = 0
+    comm_key = 0
     microbatch_queue = []
     for i in range(num_microbatches):
         microbatch_idx = i
-        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Forward"))
+        order.append(forward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Forward",
+                     comm_key, comm_key + 1))
+        comm_key += 2
         exec_engine_idx += 1
         microbatch_queue.append(microbatch_idx)
         microbatch_idx = microbatch_queue.pop(0)
-        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Backward"))
+        order.append(backward_execution_engine(context_scheduler, exec_engine_idx, microbatch_idx, f"Backward",
+                     comm_key, comm_key + 1))
+        comm_key += 2
         exec_engine_idx += 1
     assert len(microbatch_queue) == 0, "Microbatch queue should be empty"
     total_order_str = ""
     for o in order:
-        total_order_str += f"{o.tag} {o.microbatch_idx}, "
+        total_order_str += f"{o.tag} {o.microbatch_idx} ({o.recv_key}, {o.send_key}), "
     print(f"Total order V: {total_order_str}")
     context_scheduler.set_execs(order)
     return order
@@ -2182,33 +2256,51 @@ class ContextScheduler:
         self.comm_stream = torch.cuda.Stream(device)
         self.mem_stream = torch.cuda.Stream(device)
 
-        self.debug = True
+        self.comm_key = 0
+        self.debug = False
 
     def set_execs(self, execs):
         self.execs = execs
+
+    def check_exec_ready(self, exec):
+        if exec.next_op is "Finished":
+            return False
+        elif exec.next_op is "recv":
+            if self.comm_key != exec.recv_key:
+                return False
+            else:
+                self.comm_key += 1
+                return True
+        elif exec.next_op is "send":
+            if self.comm_key != exec.send_key:
+                return False
+            else:
+                self.comm_key += 1
+                return True
+        return True
 
     def schedule(self):
         next_exec_id = None
         if self.debug:
             schedule_str = ""
             for exec in self.execs:
-                schedule_str += f"{exec.exec_engine_idx} ({exec.tag} {exec.microbatch_idx}) - {exec.next_op}, "
-            print(f"[Scheduler] Current Schedule: {schedule_str}")
+                schedule_str += f"{exec.exec_engine_idx} ({exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key})) - {exec.next_op}, "
+            print(f"[Scheduler {self.comm_key}] Current Schedule: {schedule_str}")
         for exec in self.execs:
-            if exec.next_op is not None:
+            if self.check_exec_ready(exec):
                 next_exec_id = exec.exec_engine_idx
                 break
         if next_exec_id is not None:
-            self.execs[next_exec_id].signal.set()
-            self.execs[next_exec_id].next_op = "Running"
+            exec = self.execs[next_exec_id]
+            exec.signal.set()
+            exec.next_op = "Running"
             if self.debug:
-                print(f"[Scheduler] Setting next exec to {next_exec_id}")
-
+                print(f"[Scheduler {self.comm_key}] Setting next exec to {next_exec_id} - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.next_op}")
 
     def enter_context(self, exec_id, next_op):
         exec = self.execs[exec_id]
-        if self.debug:
-            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Entering context with next op {next_op}")
+        # if self.debug:
+            # print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Entering context with next op {next_op}")
         exec.signal.clear()
         exec.next_op = next_op
         exec.signal.wait()
@@ -2220,7 +2312,7 @@ class ContextScheduler:
         if self.debug:
             print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Exiting context")
         exec.signal.clear()
-        exec.next_op = None
+        exec.next_op = "Finished"
         self.schedule()
         if self.debug:
             print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Released context")
@@ -2414,8 +2506,9 @@ def forward_backward_pipelining_without_interleaving(
 
     device = next(model.parameters()).device
     context_scheduler = ContextScheduler(device, p2p_communicator.pp_group.rank())
-    # generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_microbatches)
-    generate_total_order_v(context_scheduler, num_microbatches)
+    generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_microbatches, 
+                              rank, p2p_communicator.pp_group.size())
+    # generate_total_order_v(context_scheduler, num_microbatches)
 
     input_tensors = {}
     output_tensors = {}
