@@ -1979,19 +1979,41 @@ class ContextSwitchModule(nn.Module):
         # return x
         return _PassThrough.apply(x)
 
-class forward_execution_engine(threading.Thread):
-    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag, recv_key=-1, send_key=-1):
+class base_execution_engine(threading.Thread):
+    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag, 
+                 recv_key=-1, send_key=-1):
         super().__init__()
         self.context_scheduler = context_scheduler
         self.exec_engine_idx = exec_engine_idx
         self.microbatch_idx = microbatch_idx
         self.tag = tag
-        self.next_op = None
+        self.op_type = None
+        self.op_tag = None
+        self.signal = threading.Event()
+        self.cuda_event = torch.cuda.Event()
         self.recv_key = recv_key
         self.send_key = send_key
 
-        self.signal = threading.Event()
-        self.cuda_event = torch.cuda.Event()
+    def set_args(self, *args, **kwargs):
+        """Virtual method to be overridden in derived classes."""
+        pass
+
+    def run(self):
+        """Virtual method to be overridden in derived classes."""
+        pass
+            
+    def start(self):
+        super().start()
+
+    def join(self):
+        super().join()
+
+    def is_alive(self):
+        return super().is_alive()
+
+class forward_execution_engine(base_execution_engine):
+    def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag, recv_key=-1, send_key=-1):
+        super().__init__(context_scheduler, exec_engine_idx, microbatch_idx, tag, recv_key, send_key)
 
     def set_args(self, p2p_communicator, recv_tensor_shapes, forward_step_func, 
                  data_iterator, model, num_microbatches, forward_data_store, 
@@ -2022,11 +2044,13 @@ class forward_execution_engine(threading.Thread):
 
     def run(self):
         torch.cuda.set_device(self.device)
-        self.context_scheduler.enter_context(self.exec_engine_idx, "recv")
+        self.context_scheduler.enter_context(self.exec_engine_idx, "recv", 
+            f"[Receive forward key {self.recv_key}]")
         input_tensor = self.p2p_communicator.recv_forward(
             self.recv_tensor_shapes, is_pp_first_stage(self.p2p_communicator.pp_group)
         )
-        self.context_scheduler.context_switch(self.exec_engine_idx, "comp")
+        self.context_scheduler.context_switch(self.exec_engine_idx, "comp", 
+            f"[Forward QKV]")
         output_tensor, num_tokens = forward_step(
             self.forward_step_func,
             self.data_iterator,
@@ -2043,7 +2067,8 @@ class forward_execution_engine(threading.Thread):
             current_microbatch=self.microbatch_id,
             is_last_stage=self.is_pp_last_stage(self.p2p_communicator.pp_group),
         )
-        self.context_scheduler.context_switch(self.exec_engine_idx, "send")
+        self.context_scheduler.context_switch(self.exec_engine_idx, "send", 
+            f"[Send forward key {self.send_key}]")
         self.p2p_communicator.send_forward(output_tensor, self.is_pp_last_stage(self.p2p_communicator.pp_group))
     
         self.input_tensors[self.microbatch_id] = input_tensor
@@ -2053,28 +2078,10 @@ class forward_execution_engine(threading.Thread):
         self.total_num_tokens += num_tokens
         self.context_scheduler.exit_context(self.exec_engine_idx)
 
-    def start(self):
-        super().start()
-    
-    def join(self):
-        super().join()
-    
-    def is_alive(self):
-        return super().is_alive()
 
-class backward_execution_engine(threading.Thread):
+class backward_execution_engine(base_execution_engine):
     def __init__(self, context_scheduler, exec_engine_idx, microbatch_idx, tag, recv_key=-1, send_key=-1):
-        super().__init__()
-        self.context_scheduler = context_scheduler
-        self.exec_engine_idx = exec_engine_idx
-        self.microbatch_idx = microbatch_idx
-        self.tag = tag
-        self.next_op = None
-        self.recv_key = recv_key
-        self.send_key = send_key
-        
-        self.signal = threading.Event()
-        self.cuda_event = torch.cuda.Event()
+        super().__init__(context_scheduler, exec_engine_idx, microbatch_idx, tag, recv_key, send_key)
         
     def set_args(self, input_tensors, output_tensors, microbatch_id, num_microbatches, 
                  send_tensor_shapes, p2p_communicator, enable_grad_sync,
@@ -2093,8 +2100,9 @@ class backward_execution_engine(threading.Thread):
         
     def run(self):
         torch.cuda.set_device(self.device)
-        self.context_scheduler.enter_context(self.exec_engine_idx, "recv")
-        if self.microbatch_id == self.num_microbatches - 1:
+        self.context_scheduler.enter_context(self.exec_engine_idx, "recv", 
+                f"[Receive backward key {self.recv_key}]")
+        if self.microbatch_id == self.num_microbatches - 1: 
             if self.config.grad_sync_func is None or self.rank == 0:
                 self.enable_grad_sync()
 
@@ -2104,11 +2112,13 @@ class backward_execution_engine(threading.Thread):
         output_tensor_grad = self.p2p_communicator.recv_backward(
             self.send_tensor_shapes, is_pp_last_stage(self.p2p_communicator.pp_group)
         )
-        self.context_scheduler.context_switch(self.exec_engine_idx, "comp")
+        self.context_scheduler.context_switch(self.exec_engine_idx, "comp", 
+            f"[Backward combine]")
         input_tensor_grad = backward_step(
             input_tensor, output_tensor, output_tensor_grad, self.model_type, self.config
         )
-        self.context_scheduler.context_switch(self.exec_engine_idx, "send")
+        self.context_scheduler.context_switch(self.exec_engine_idx, "send", 
+            f"[Send backward key {self.send_key}]")
         self.p2p_communicator.send_backward(
             input_tensor_grad, is_pp_first_stage(self.p2p_communicator.pp_group)
         )
@@ -2116,21 +2126,12 @@ class backward_execution_engine(threading.Thread):
         self.output_tensors[self.microbatch_id] = None
         self.context_scheduler.exit_context(self.exec_engine_idx)
 
-    def start(self):
-        super().start()
-    
-    def join(self):
-        super().join()
-    
-    def is_alive(self):
-        return super().is_alive()
-
 def calculate_1f1b_comm_keys(pp_rank, pp_size, num_microbatches) -> int:
     order_key = 0
     total_order_keys = []
     for n in range(num_microbatches):
         total_order_keys.append({"fwd_recv_key": -1, "fwd_send_key": -1, 
-                                    "bwd_recv_key": -1, "bwd_send_key": -1})
+                                 "bwd_recv_key": -1, "bwd_send_key": -1})
     for n in range(num_microbatches + pp_size * 2):
         if pp_rank % 2 == 0:
             fwr_mb = n - pp_rank
@@ -2251,27 +2252,45 @@ class ContextScheduler:
         self.pp_rank = pp_rank
         self.execs = None
 
+        self.co_schedule_idx = []
+
         torch.cuda.set_device(self.device)
         self.comp_stream = torch.cuda.Stream(device)
         self.comm_stream = torch.cuda.Stream(device)
         self.mem_stream = torch.cuda.Stream(device)
 
         self.comm_key = 0
-        self.debug = False
+        self.debug = True
 
     def set_execs(self, execs):
         self.execs = execs
 
+    def check_all_execs_finished(self):
+        for exec in self.execs:
+            if exec.op_type is not "Finished":
+                return False
+        return True
+
+    def get_stream(self, exec):
+        if exec.op_type is "comp":
+            return self.comp_stream
+        elif exec.op_type is "mem":
+            return self.mem_stream
+        elif exec.op_type is "comm" or exec.op_type is "send" or exec.op_type is "recv":
+            return self.comm_stream
+        else:
+           assert False, f"Invalid next op: {exec.op_type}"
+
     def check_exec_ready(self, exec):
-        if exec.next_op is "Finished":
+        if exec.op_type is "Finished":
             return False
-        elif exec.next_op is "recv":
+        elif exec.op_type is "recv":
             if self.comm_key != exec.recv_key:
                 return False
             else:
                 self.comm_key += 1
                 return True
-        elif exec.next_op is "send":
+        elif exec.op_type is "send":
             if self.comm_key != exec.send_key:
                 return False
             else:
@@ -2281,52 +2300,85 @@ class ContextScheduler:
 
     def schedule(self):
         next_exec_id = None
-        if self.debug:
-            schedule_str = ""
+        if len(self.co_schedule_idx) == 0:
+            if self.debug:
+                schedule_str = ""
+                for exec in self.execs:
+                    schedule_str += f"{exec.exec_engine_idx} ({exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key})) - {exec.op_type}, "
+                print(f"[Scheduler {self.comm_key}] Current Schedule: {schedule_str}")
+            
+            # Schedule compute ops
             for exec in self.execs:
-                schedule_str += f"{exec.exec_engine_idx} ({exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key})) - {exec.next_op}, "
-            print(f"[Scheduler {self.comm_key}] Current Schedule: {schedule_str}")
-        for exec in self.execs:
-            if self.check_exec_ready(exec):
-                next_exec_id = exec.exec_engine_idx
-                break
-        if next_exec_id is not None:
+                if exec.op_type is "comp" and self.check_exec_ready(exec):
+                    self.co_schedule_idx.append(exec.exec_engine_idx)
+                    if self.debug:
+                        print(f"[Scheduler {self.comm_key}] Co-scheduling comp exec - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
+                    break
+            # Schedule memory ops
+            for exec in self.execs:
+                if exec.op_type is "mem" and self.check_exec_ready(exec):
+                    self.co_schedule_idx.append(exec.exec_engine_idx)
+                    if self.debug:
+                        print(f"[Scheduler {self.comm_key}] Co-scheduling mem exec - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
+                    break
+            # Schedule communication ops
+            for exec in self.execs:
+                if exec.op_type is "comm" or exec.op_type is "send" or exec.op_type is "recv":
+                    if self.check_exec_ready(exec):
+                        self.co_schedule_idx.append(exec.exec_engine_idx)
+                        if self.debug:
+                            print(f"[Scheduler {self.comm_key}] Co-scheduling comm exec - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
+                        break
+
+        if len(self.co_schedule_idx) > 0:
+            next_exec_id = self.co_schedule_idx.pop(0)
             exec = self.execs[next_exec_id]
             exec.signal.set()
-            exec.next_op = "Running"
             if self.debug:
-                print(f"[Scheduler {self.comm_key}] Setting next exec to {next_exec_id} - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.next_op}")
+                print(f"[Scheduler {self.comm_key}] Setting next exec to {next_exec_id} - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
+        elif self.check_all_execs_finished():
+            if self.debug:
+                print(f"[Scheduler {self.comm_key}] All execs finished")
+            return
+        else:
+            assert False, "No execs to schedule"
 
-    def enter_context(self, exec_id, next_op):
+    def enter_context(self, exec_id, op_type, op_tag):
         exec = self.execs[exec_id]
         # if self.debug:
-            # print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Entering context with next op {next_op}")
+            # print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Entering context with next op {op_type}")
         exec.signal.clear()
-        exec.next_op = next_op
+        exec.op_type = op_type
+        exec.op_tag = op_tag
         exec.signal.wait()
-        if self.debug:
-            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Entered context")
+        # if self.debug:
+        #     print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Entered context")
 
     def exit_context(self, exec_id):
         exec = self.execs[exec_id]
-        if self.debug:
-            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Exiting context")
+        # if self.debug:
+        #     print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Exiting context")
         exec.signal.clear()
-        exec.next_op = "Finished"
+        exec.op_type = "Finished"
         self.schedule()
-        if self.debug:
-            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Released context")
+        # if self.debug:
+        #     print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Released context")
 
-    def context_switch(self, exec_id, next_op):
+    def context_switch(self, exec_id, op_type, op_tag):
         exec = self.execs[exec_id]
-        if self.debug:
-            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Releasing context")
+        # if self.debug:
+        #     print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Releasing context")
         exec.signal.clear()
-        exec.next_op = next_op
+        old_stream = self.get_stream(exec)
+        exec.cuda_event.record(stream=old_stream)
+        exec.op_type = op_type
+        exec.op_tag = op_tag
         self.schedule()
         exec.signal.wait()
-        if self.debug:
-            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Acquiring context")
+        new_stream = self.get_stream(exec)
+        new_stream.wait_event(exec.cuda_event)
+        # if self.debug:
+        #     print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Acquiring context")
 
     def start(self):
         for exec in self.execs:
@@ -2462,7 +2514,7 @@ def forward_backward_pipelining_without_interleaving(
 
     # Compute number of warmup microbatches.
     num_warmup_microbatches = (
-        p2p_communicator.pp_group.size() - p2p_communicator.pp_group.rank() - 1
+        (p2p_communicator.pp_group.size() - p2p_communicator.pp_group.rank())*2 - 1
     )
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     
