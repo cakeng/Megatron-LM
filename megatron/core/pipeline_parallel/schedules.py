@@ -2112,11 +2112,13 @@ class backward_execution_engine(base_execution_engine):
         output_tensor_grad = self.p2p_communicator.recv_backward(
             self.send_tensor_shapes, is_pp_last_stage(self.p2p_communicator.pp_group)
         )
+        self.context_scheduler.enter_serialized_region(self.exec_engine_idx, "backward_serial")
         self.context_scheduler.context_switch(self.exec_engine_idx, "comp", 
             f"[Backward combine]")
         input_tensor_grad = backward_step(
             input_tensor, output_tensor, output_tensor_grad, self.model_type, self.config
         )
+        self.context_scheduler.exit_serialized_region(self.exec_engine_idx, "backward_serial")
         self.context_scheduler.context_switch(self.exec_engine_idx, "send", 
             f"[Send backward key {self.send_key}]")
         self.p2p_communicator.send_backward(
@@ -2253,6 +2255,8 @@ class ContextScheduler:
         self.execs = None
 
         self.co_schedule_idx = []
+        self.tid_to_exec_idx = {}
+        self.current_bwd_idx = -1
 
         torch.cuda.set_device(self.device)
         self.comp_stream = torch.cuda.Stream(device)
@@ -2260,6 +2264,7 @@ class ContextScheduler:
         self.mem_stream = torch.cuda.Stream(device)
 
         self.comm_key = 0
+        self.serialized_region_key = {}
         self.debug = True
 
     def set_execs(self, execs):
@@ -2267,36 +2272,44 @@ class ContextScheduler:
 
     def check_all_execs_finished(self):
         for exec in self.execs:
-            if exec.op_type is not "Finished":
+            if exec.op_type != "Finished":
                 return False
         return True
 
     def get_stream(self, exec):
-        if exec.op_type is "comp":
+        if exec.op_type == "comp":
             return self.comp_stream
-        elif exec.op_type is "mem":
+        elif exec.op_type == "mem":
             return self.mem_stream
-        elif exec.op_type is "comm" or exec.op_type is "send" or exec.op_type is "recv":
+        elif exec.op_type == "comm" or exec.op_type == "send" or exec.op_type == "recv":
             return self.comm_stream
         else:
            assert False, f"Invalid next op: {exec.op_type}"
 
-    def check_exec_ready(self, exec):
-        if exec.op_type is "Finished":
-            return False
-        elif exec.op_type is "recv":
+    def check_p2p_ready(self, exec):
+        if exec.op_type == "recv":
             if self.comm_key != exec.recv_key:
                 return False
             else:
                 self.comm_key += 1
                 return True
-        elif exec.op_type is "send":
+        elif exec.op_type == "send":
             if self.comm_key != exec.send_key:
                 return False
             else:
                 self.comm_key += 1
                 return True
-        return True
+        else:
+            assert False, f"Invalid op type: {exec.op_type}"
+
+    def check_serialized_region_ready(self, exec):
+        if exec.op_type == "SerializedRegion":
+            if self.serialized_region_key[exec.op_tag] < exec.microbatch_idx:
+                return False
+            else:
+                return True
+        else:
+            assert False, f"Invalid op type: {exec.op_type}"
 
     def schedule(self):
         next_exec_id = None
@@ -2309,25 +2322,33 @@ class ContextScheduler:
             
             # Schedule compute ops
             for exec in self.execs:
-                if exec.op_type is "comp" and self.check_exec_ready(exec):
+                if exec.op_type == "comp":
                     self.co_schedule_idx.append(exec.exec_engine_idx)
                     if self.debug:
                         print(f"[Scheduler {self.comm_key}] Co-scheduling comp exec - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
                     break
             # Schedule memory ops
             for exec in self.execs:
-                if exec.op_type is "mem" and self.check_exec_ready(exec):
+                if exec.op_type == "mem":
                     self.co_schedule_idx.append(exec.exec_engine_idx)
                     if self.debug:
                         print(f"[Scheduler {self.comm_key}] Co-scheduling mem exec - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
                     break
             # Schedule communication ops
             for exec in self.execs:
-                if exec.op_type is "comm" or exec.op_type is "send" or exec.op_type is "recv":
-                    if self.check_exec_ready(exec):
+                if exec.op_type == "comm" or exec.op_type == "send" or exec.op_type == "recv":
+                    if self.check_p2p_ready(exec):
                         self.co_schedule_idx.append(exec.exec_engine_idx)
                         if self.debug:
                             print(f"[Scheduler {self.comm_key}] Co-scheduling comm exec - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
+                        break
+            # Schedule serialized region ops
+            for exec in self.execs:
+                if exec.op_type == "SerializedRegion":
+                    if self.check_serialized_region_ready(exec):
+                        self.co_schedule_idx.append(exec.exec_engine_idx)
+                        if self.debug:
+                            print(f"[Scheduler {self.comm_key}] Co-scheduling serialized region exec - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
                         break
 
         if len(self.co_schedule_idx) > 0:
@@ -2342,6 +2363,36 @@ class ContextScheduler:
             return
         else:
             assert False, "No execs to schedule"
+
+    def enter_serialized_region(self, exec_id, region_name=""):
+        exec = self.execs[exec_id]
+        exec.signal.clear()
+        old_op_type = exec.op_type
+        old_op_tag = exec.op_tag
+        exec.op_type = "SerializedRegion"
+        exec.op_tag = region_name
+        if region_name not in self.serialized_region_key:
+            self.serialized_region_key[region_name] = 0
+        if self.serialized_region_key[region_name] < exec.microbatch_idx:
+            self.schedule()
+            exec.signal.wait()
+        elif self.serialized_region_key[region_name] > exec.microbatch_idx:
+            assert False, f"Serialized region key {self.serialized_region_key[region_name]} is greater than microbatch index {exec.microbatch_idx}"
+        if region_name == "backward_serial":
+            self.current_bwd_idx = exec_id
+        if self.debug:
+            print(f"[Scheduler {self.comm_key}] Entered serialized region {region_name}")
+        exec.op_type = old_op_type
+        exec.op_tag = old_op_tag
+
+    def exit_serialized_region(self, exec_id, region_name=""):
+        exec = self.execs[exec_id]
+        exec.signal.clear()
+        self.serialized_region_key[region_name] += 1
+        if region_name == "backward_serial":
+            self.current_bwd_idx = -1
+        if self.debug:
+            print(f"[Scheduler {self.comm_key}] Exited serialized region {region_name}")
 
     def enter_context(self, exec_id, op_type, op_tag):
         exec = self.execs[exec_id]
@@ -2383,6 +2434,8 @@ class ContextScheduler:
     def start(self):
         for exec in self.execs:
             exec.start()
+        for exec in self.execs:
+            self.tid_to_exec_idx[exec.ident] = exec.exec_engine_idx
         if self.debug:
             print(f"[Scheduler] Starting scheduler")
         self.schedule()
@@ -2390,6 +2443,67 @@ class ContextScheduler:
     def join(self):
         for exec in self.execs:
             exec.join()
+
+class HookManager:
+    def __init__(self, context_scheduler, model, debug=False):
+        self.context_scheduler = context_scheduler
+        self.model = model
+        self.hooks = {}
+        self.debug = debug
+    
+    def tag_module_name(self, module, module_name=None):
+        # Set the exec_name for the current module
+        if module_name is None:
+            module.module_name = module.__class__.__name__
+        else:
+            module.module_name = module_name    
+        
+        for child_name, child_module in module.named_children():
+            self.tag_module_name(child_module, module.module_name + "_" + child_name)
+
+    def attach_hooks(self):
+        """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
+        print(f" Attaching hooks...")
+        self.tag_module_name(self.model)
+        self.detach_hooks() # Clear any old hooks first
+        for module in self.model.modules():
+            module_name = module.module_name
+            context_switch_module_list = ["context_switch_module"]
+            self.hooks[module_name] = []
+            if any(module_class_str in module_name for module_class_str in context_switch_module_list):
+                fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
+                bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
+                self.hooks[module_name].append(fwd_hook)
+                self.hooks[module_name].append(bwd_hook)
+                if self.debug:
+                    print(f"Attached forward and backward context switch hooks to {module_name}")
+            if len(self.hooks[module_name]) == 0:
+                del self.hooks[module_name]
+                              
+        print(f"Hooks: {self.hooks}")
+    
+    def detach_hooks(self):
+        for fwd_hook, bwd_hook in self.hooks.values():
+            fwd_hook.remove()
+            if bwd_hook is not None:
+                bwd_hook.remove()
+        self.hooks = {}
+        
+    def forward_scheduler_hook(self, module, input, output):
+        exec_id = self.context_scheduler.tid_to_exec_idx[threading.current_thread().ident]
+        if self.debug:
+            print(f"Forward hook {exec_id} fired on {module.module_name}")
+        self.context_scheduler.context_switch(exec_id, module.op_type, module.op_tag)
+        if self.debug:
+            print(f"Forward hook {exec_id} completed")
+
+    def backward_scheduler_hook(self, module, grad_input, grad_output):
+        exec_id = self.context_scheduler.current_bwd_idx
+        if self.debug:
+            print(f"Backward hook {exec_id} fired on {module.module_name}")
+        self.context_scheduler.context_switch(exec_id, module.op_type, module.op_tag)
+        if self.debug:
+            print(f"Backward hook {exec_id} completed")
 
 def forward_backward_pipelining_without_interleaving(
     *,
@@ -2558,6 +2672,8 @@ def forward_backward_pipelining_without_interleaving(
 
     device = next(model.parameters()).device
     context_scheduler = ContextScheduler(device, p2p_communicator.pp_group.rank())
+    hook_manager = HookManager(context_scheduler, model)
+    hook_manager.attach_hooks()
     generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_microbatches, 
                               rank, p2p_communicator.pp_group.size())
     # generate_total_order_v(context_scheduler, num_microbatches)
@@ -2580,15 +2696,17 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        if exec.tag == "Forward":
+        if isinstance(exec, forward_execution_engine):
             exec.set_args(p2p_communicator, recv_tensor_shapes, forward_step_func, 
                     data_iterator, model, num_microbatches, forward_data_store[microbatch_idx], config, pg_collection, 
                     collect_non_loss_data, checkpoint_activations_microbatch, first_val_step, microbatch_idx, 
                     is_pp_last_stage, forward_only, input_tensors, output_tensors, total_num_tokens, device)
-        else:
+        elif isinstance(exec, backward_execution_engine):
             exec.set_args(input_tensors, output_tensors, microbatch_idx,
                     num_microbatches, send_tensor_shapes, p2p_communicator, enable_grad_sync, 
                     model_type, config, rank, device)
+        else:
+            assert False, f"Invalid exec type: {type(exec)}"
 
     # Run scheduler
     context_scheduler.start()
