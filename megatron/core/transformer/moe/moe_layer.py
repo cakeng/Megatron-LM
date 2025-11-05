@@ -166,6 +166,16 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+        from megatron.core.pipeline_parallel.schedules import ContextSwitchModule
+        self.route_and_dispatch_context_switch_module = ContextSwitchModule(fwd_op_type="comm", fwd_op_tag="route_and_dispatch", do_fwd=True,
+                                                                            bwd_op_type="comp", bwd_op_tag="out_proj", do_bwd=True)
+        self.experts_compute_context_switch_module = ContextSwitchModule(fwd_op_type="comp", fwd_op_tag="experts_compute", do_fwd=True,
+                                                                         bwd_op_type="comm", bwd_op_tag="route_and_dispatch", do_bwd=True)
+        self.combine_context_switch_module = ContextSwitchModule(fwd_op_type="comm", fwd_op_tag="combine", do_fwd=True,
+                                                                  bwd_op_type="comp", bwd_op_tag="experts_compute", do_bwd=True)
+        self.combine_postprocess_context_switch_module = ContextSwitchModule(fwd_op_type=None, fwd_op_tag=None, do_fwd=False,
+                                                                             bwd_op_type="comm", bwd_op_tag="combine", do_bwd=False)
+
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """Compute and preprocess token routing for dispatch.
 
@@ -263,12 +273,18 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
+            hidden_states = self.route_and_dispatch_context_switch_module(hidden_states)
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
+
+            dispatched_input = self.experts_compute_context_switch_module(dispatched_input)
             output, shared_expert_output, mlp_bias = self.experts_compute(
                 dispatched_input, probs, residual
             )
+
+            output = self.combine_context_switch_module(output)
             output = self.combine(output, shared_expert_output)
+            output = self.combine_postprocess_context_switch_module(output)
             return output, mlp_bias
 
         if self.moe_layer_recompute:

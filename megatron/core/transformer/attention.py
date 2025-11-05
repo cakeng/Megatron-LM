@@ -216,6 +216,15 @@ class Attention(MegatronModule, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+        from megatron.core.pipeline_parallel.schedules import ContextSwitchModule
+
+        self.qkv_context_switch_module = ContextSwitchModule(fwd_op_type="comp", fwd_op_tag="qkv_proj", do_fwd=True,
+                                                             bwd_op_type=None, bwd_op_tag=None, do_bwd=False)
+        self.attn_context_switch_module = ContextSwitchModule(fwd_op_type="mem", fwd_op_tag="attn", do_fwd=True,
+                                                              bwd_op_type="comp", bwd_op_tag="qkv_proj", do_bwd=True)
+        self.out_context_switch_module = ContextSwitchModule(fwd_op_type="comp", fwd_op_tag="out_proj", do_fwd=True,
+                                                             bwd_op_type="mem", bwd_op_tag="attn", do_bwd=True)
+
     def _checkpointed_attention_forward(
         self,
         query,
@@ -700,6 +709,7 @@ class Attention(MegatronModule, ABC):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
+        hidden_states = self.qkv_context_switch_module(hidden_states)
         nvtx_range_push(suffix="qkv")
         split_qkv = (self.attention_type == "cross") or not all(
             [
@@ -860,6 +870,7 @@ class Attention(MegatronModule, ABC):
         # ==================================
         # core attention computation
         # ==================================
+        query = self.attn_context_switch_module(query)
 
         nvtx_range_push(suffix="core_attention")
         if self.checkpoint_core_attention and self.training:
@@ -915,6 +926,7 @@ class Attention(MegatronModule, ABC):
         # =================
         # Output. [sq, b, h]
         # =================
+        core_attn_out = self.out_context_switch_module(core_attn_out)
 
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)

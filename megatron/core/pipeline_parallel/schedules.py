@@ -1968,12 +1968,16 @@ class _PassThrough(Function):
 class ContextSwitchModule(nn.Module):
     def __init__(self, force_switch: bool = False, 
                  do_fwd: bool = True, do_bwd: bool = True,
-                 tag: str = None):
+                 fwd_op_type: str = None, fwd_op_tag: str = None,
+                 bwd_op_type: str = None, bwd_op_tag: str = None):
         super().__init__()
         self.force_switch = force_switch
         self.do_fwd = do_fwd
         self.do_bwd = do_bwd
-        self.tag = tag
+        self.fwd_op_type = fwd_op_type
+        self.fwd_op_tag = fwd_op_tag
+        self.bwd_op_type = bwd_op_type
+        self.bwd_op_tag = bwd_op_tag
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Ensures a grad_fn exists even if this would be a pure identity
         # return x
@@ -1987,8 +1991,8 @@ class base_execution_engine(threading.Thread):
         self.exec_engine_idx = exec_engine_idx
         self.microbatch_idx = microbatch_idx
         self.tag = tag
-        self.op_type = None
-        self.op_tag = None
+        self.fwd_op_type = None
+        self.fwd_op_tag = None
         self.signal = threading.Event()
         self.cuda_event = torch.cuda.Event()
         self.recv_key = recv_key
@@ -2044,13 +2048,12 @@ class forward_execution_engine(base_execution_engine):
 
     def run(self):
         torch.cuda.set_device(self.device)
+        self.context_scheduler.tid_to_exec_idx[threading.current_thread().ident] = self.exec_engine_idx
         self.context_scheduler.enter_context(self.exec_engine_idx, "recv", 
             f"[Receive forward key {self.recv_key}]")
         input_tensor = self.p2p_communicator.recv_forward(
             self.recv_tensor_shapes, is_pp_first_stage(self.p2p_communicator.pp_group)
         )
-        self.context_scheduler.context_switch(self.exec_engine_idx, "comp", 
-            f"[Forward QKV]")
         output_tensor, num_tokens = forward_step(
             self.forward_step_func,
             self.data_iterator,
@@ -2100,6 +2103,7 @@ class backward_execution_engine(base_execution_engine):
         
     def run(self):
         torch.cuda.set_device(self.device)
+        self.context_scheduler.tid_to_exec_idx[threading.current_thread().ident] = self.exec_engine_idx
         self.context_scheduler.enter_context(self.exec_engine_idx, "recv", 
                 f"[Receive backward key {self.recv_key}]")
         if self.microbatch_id == self.num_microbatches - 1: 
@@ -2113,8 +2117,6 @@ class backward_execution_engine(base_execution_engine):
             self.send_tensor_shapes, is_pp_last_stage(self.p2p_communicator.pp_group)
         )
         self.context_scheduler.enter_serialized_region(self.exec_engine_idx, "backward_serial")
-        self.context_scheduler.context_switch(self.exec_engine_idx, "comp", 
-            f"[Backward combine]")
         input_tensor_grad = backward_step(
             input_tensor, output_tensor, output_tensor_grad, self.model_type, self.config
         )
@@ -2265,7 +2267,7 @@ class ContextScheduler:
 
         self.comm_key = 0
         self.serialized_region_key = {}
-        self.debug = True
+        self.debug = False
 
     def set_execs(self, execs):
         self.execs = execs
@@ -2286,8 +2288,10 @@ class ContextScheduler:
         else:
            assert False, f"Invalid next op: {exec.op_type}"
 
-    def check_p2p_ready(self, exec):
-        if exec.op_type == "recv":
+    def check_comm_ready(self, exec):
+        if exec.op_type == "comm":
+            return True
+        elif exec.op_type == "recv":
             if self.comm_key != exec.recv_key:
                 return False
             else:
@@ -2337,7 +2341,7 @@ class ContextScheduler:
             # Schedule communication ops
             for exec in self.execs:
                 if exec.op_type == "comm" or exec.op_type == "send" or exec.op_type == "recv":
-                    if self.check_p2p_ready(exec):
+                    if self.check_comm_ready(exec):
                         self.co_schedule_idx.append(exec.exec_engine_idx)
                         if self.debug:
                             print(f"[Scheduler {self.comm_key}] Co-scheduling comm exec - {exec.tag} {exec.microbatch_idx} ({exec.recv_key}, {exec.send_key}) - {exec.op_tag}")
@@ -2381,7 +2385,7 @@ class ContextScheduler:
         if region_name == "backward_serial":
             self.current_bwd_idx = exec_id
         if self.debug:
-            print(f"[Scheduler {self.comm_key}] Entered serialized region {region_name}")
+            print(f"[Scheduler {self.comm_key}] Exec {exec_id} entered serialized region {region_name}")
         exec.op_type = old_op_type
         exec.op_tag = old_op_tag
 
@@ -2392,7 +2396,7 @@ class ContextScheduler:
         if region_name == "backward_serial":
             self.current_bwd_idx = -1
         if self.debug:
-            print(f"[Scheduler {self.comm_key}] Exited serialized region {region_name}")
+            print(f"[Scheduler {self.comm_key}] Exec {exec_id} exited serialized region {region_name}")
 
     def enter_context(self, exec_id, op_type, op_tag):
         exec = self.execs[exec_id]
@@ -2417,8 +2421,8 @@ class ContextScheduler:
 
     def context_switch(self, exec_id, op_type, op_tag):
         exec = self.execs[exec_id]
-        # if self.debug:
-        #     print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx})] Releasing context")
+        if self.debug:
+            print(f"[Exec {exec_id} ({exec.tag} {exec.microbatch_idx}) -> {op_type} {op_tag}] Releasing context")
         exec.signal.clear()
         old_stream = self.get_stream(exec)
         exec.cuda_event.record(stream=old_stream)
@@ -2434,8 +2438,6 @@ class ContextScheduler:
     def start(self):
         for exec in self.execs:
             exec.start()
-        for exec in self.execs:
-            self.tid_to_exec_idx[exec.ident] = exec.exec_engine_idx
         if self.debug:
             print(f"[Scheduler] Starting scheduler")
         self.schedule()
@@ -2445,13 +2447,16 @@ class ContextScheduler:
             exec.join()
 
 class HookManager:
-    def __init__(self, context_scheduler, model, debug=False):
+    def __init__(self, context_scheduler, model, num_microbatches, num_warmup_microbatches, debug=False):
         self.context_scheduler = context_scheduler
         self.model = model
+        self.num_microbatches = num_microbatches
+        self.num_warmup_microbatches = num_warmup_microbatches
         self.hooks = {}
         self.debug = debug
+        self._attach_hooks()
     
-    def tag_module_name(self, module, module_name=None):
+    def _tag_module_name(self, module, module_name=None):
         # Set the exec_name for the current module
         if module_name is None:
             module.module_name = module.__class__.__name__
@@ -2459,12 +2464,12 @@ class HookManager:
             module.module_name = module_name    
         
         for child_name, child_module in module.named_children():
-            self.tag_module_name(child_module, module.module_name + "_" + child_name)
+            self._tag_module_name(child_module, module.module_name + "_" + child_name)
 
-    def attach_hooks(self):
+    def _attach_hooks(self):
         """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
         print(f" Attaching hooks...")
-        self.tag_module_name(self.model)
+        self._tag_module_name(self.model)
         self.detach_hooks() # Clear any old hooks first
         for module in self.model.modules():
             module_name = module.module_name
@@ -2479,8 +2484,8 @@ class HookManager:
                     print(f"Attached forward and backward context switch hooks to {module_name}")
             if len(self.hooks[module_name]) == 0:
                 del self.hooks[module_name]
-                              
-        print(f"Hooks: {self.hooks}")
+        if self.debug:
+            print(f"Hooks: {self.hooks}")
     
     def detach_hooks(self):
         for fwd_hook, bwd_hook in self.hooks.values():
@@ -2490,18 +2495,28 @@ class HookManager:
         self.hooks = {}
         
     def forward_scheduler_hook(self, module, input, output):
+        if not module.do_fwd:
+            return
         exec_id = self.context_scheduler.tid_to_exec_idx[threading.current_thread().ident]
+        microbatch_idx = self.context_scheduler.execs[exec_id].microbatch_idx
+        if microbatch_idx < self.num_warmup_microbatches:
+            return # Skip context switch for the first microbatch - Faster warmup
         if self.debug:
             print(f"Forward hook {exec_id} fired on {module.module_name}")
-        self.context_scheduler.context_switch(exec_id, module.op_type, module.op_tag)
+        self.context_scheduler.context_switch(exec_id, module.fwd_op_type, module.fwd_op_tag)
         if self.debug:
             print(f"Forward hook {exec_id} completed")
 
     def backward_scheduler_hook(self, module, grad_input, grad_output):
+        if not module.do_bwd:
+            return
         exec_id = self.context_scheduler.current_bwd_idx
+        microbatch_idx = self.context_scheduler.execs[exec_id].microbatch_idx
+        if microbatch_idx >= self.num_microbatches - self.num_warmup_microbatches:
+            return # Skip context switch for the last microbatch - Faster cooldown
         if self.debug:
             print(f"Backward hook {exec_id} fired on {module.module_name}")
-        self.context_scheduler.context_switch(exec_id, module.op_type, module.op_tag)
+        self.context_scheduler.context_switch(exec_id, module.bwd_op_type, module.bwd_op_tag)
         if self.debug:
             print(f"Backward hook {exec_id} completed")
 
@@ -2672,8 +2687,7 @@ def forward_backward_pipelining_without_interleaving(
 
     device = next(model.parameters()).device
     context_scheduler = ContextScheduler(device, p2p_communicator.pp_group.rank())
-    hook_manager = HookManager(context_scheduler, model)
-    hook_manager.attach_hooks()
+    hook_manager = HookManager(context_scheduler, model, num_microbatches, num_warmup_microbatches)
     generate_total_order_1f1b(context_scheduler, num_microbatches, num_warmup_microbatches, 
                               rank, p2p_communicator.pp_group.size())
     # generate_total_order_v(context_scheduler, num_microbatches)
@@ -2712,7 +2726,9 @@ def forward_backward_pipelining_without_interleaving(
     context_scheduler.start()
     context_scheduler.join()
 
-        # Launch any remaining grad reductions.
+    hook_manager.detach_hooks()
+
+    # Launch any grad reductions.
     if no_sync_context is not None:
         enable_grad_sync()
         if config.grad_sync_func is not None:
