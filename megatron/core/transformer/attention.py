@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Tuple, Union
+from typing import List, NoReturn, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -1133,6 +1133,564 @@ class SelfAttention(Attention):
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         set_save_original_input(self.linear_qkv)
+
+@dataclass
+class SelfAttention2ForwardState:
+    """Holds intermediate tensors for chunked SelfAttention2 execution."""
+
+    attention_mask: Optional[Tensor] = None
+    attention_bias: Optional[Tensor] = None
+    rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None
+    rotary_pos_cos: Optional[Tensor] = None
+    rotary_pos_sin: Optional[Tensor] = None
+    rotary_pos_cos_sin: Optional[Tensor] = None
+    packed_seq_params: Optional[PackedSeqParams] = None
+    sequence_len_offset: Optional[Tensor] = None
+    inference_context: Optional[BaseInferenceContext] = None
+    attn_mask_type: AttnMaskType = AttnMaskType.padding
+    block_table: Optional[Tensor] = None
+    split_qkv: bool = True
+    mixed_qkv: Optional[Tensor] = None
+    qkv_split_arg_list: Optional[List[int]] = None
+    query: Optional[Tensor] = None
+    key: Optional[Tensor] = None
+    value: Optional[Tensor] = None
+    core_attn_out: Optional[Tensor] = None
+    output_with_bias: Optional[Tuple[Tensor, Tensor]] = None
+    in_decode_mode: bool = False
+
+
+class SelfAttention2(Attention):
+    """Self-attention layer class
+
+    Self-attention layer takes input with size [s, b, h]
+    and returns output of the same size.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: SelfAttentionSubmodules,
+        layer_number: int,
+        attn_mask_type=AttnMaskType.padding,
+        cp_comm_type: str = None,
+        pg_collection: ProcessGroupCollection = None,
+    ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type="self",
+            cp_comm_type=cp_comm_type,
+            pg_collection=pg_collection,
+        )
+        print(f"//// Using SelfAttention2 ////")
+
+        self.linear_qkv = build_module(
+            submodules.linear_qkv,
+            self.config.hidden_size,
+            self.query_projection_size + 2 * self.kv_projection_size,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name='qkv',
+            tp_group=self.pg_collection.tp,
+        )
+
+        if submodules.q_layernorm is not None:
+            self.q_layernorm = build_module(
+                submodules.q_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.q_layernorm = None
+
+        if submodules.k_layernorm is not None:
+            self.k_layernorm = build_module(
+                submodules.k_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.k_layernorm = None
+
+    def run_realtime_tests(self):
+        """Performs a consistency check.
+
+        This function makes sure that tensors across devices are the same during an experiment.
+        This is often not guaranteed to be so because of silent hardware failures (eg, memory
+        corruption loading a checkpoint, network traffic corruption encountered during
+        data transmission).
+
+        (TODO) In the future, more tensors should be checked across the training run and
+        checked every X iterations. This is left for future work. Equality of tensors is probably
+        not required; transmitting hashes is sufficient."""
+
+        if not self.config.qk_layernorm:
+            return
+
+        # check that all tensor parallel and data parallel ranks have the same
+        # Q & K layernorm parameters.
+        rank = get_data_parallel_rank()
+        inputs = torch.stack(
+            [
+                self.q_layernorm.weight.data,
+                self.q_layernorm.bias.data,
+                self.k_layernorm.weight.data,
+                self.k_layernorm.bias.data,
+            ]
+        )
+        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+        dp_list[rank] = inputs
+        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+
+        def _compare(srcs, tgts, names, parallelism):
+            assert len(srcs) == len(tgts) == len(names)
+            for src, tgt, name in zip(srcs, tgts, names):
+                assert torch.all(src == tgt), (
+                    f"Discrepancy between {name} in {parallelism} ranks {i} and {rank}. "
+                    f"Diff: {torch.norm(src - tgt)}"
+                )
+
+        for i, dp in enumerate(dp_list):
+            q_w, q_b, k_w, k_b = torch.unbind(dp)
+            _compare(
+                [q_w, q_b, k_w, k_b],
+                [
+                    self.q_layernorm.weight.data,
+                    self.q_layernorm.bias.data,
+                    self.k_layernorm.weight.data,
+                    self.k_layernorm.bias.data,
+                ],
+                ["q_w", "q_b", "k_w", "k_b"],
+                "DP",
+            )
+
+        rank = get_tensor_model_parallel_rank()
+        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+        tp_list[rank] = inputs
+        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+
+        for i, tp in enumerate(tp_list):
+            q_w, q_b, k_w, k_b = torch.unbind(tp)
+            _compare(
+                [q_w, q_b, k_w, k_b],
+                [
+                    self.q_layernorm.weight.data,
+                    self.q_layernorm.bias.data,
+                    self.k_layernorm.weight.data,
+                    self.k_layernorm.bias.data,
+                ],
+                ["q_w", "q_b", "k_w", "k_b"],
+                "TP",
+            )
+
+    def get_query_key_value_tensors(self, hidden_states, key_value_states=None, split_qkv=True):
+        """
+        Derives `query`, `key` and `value` tensors from `hidden_states`. If `split_qkv=False`, then
+        the unsplit mixed_qkv tensor is returned.
+        """
+        # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+        mixed_qkv, _ = self.linear_qkv(hidden_states)
+
+        # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+        new_tensor_shape = mixed_qkv.size()[:-1] + (
+            self.num_query_groups_per_partition,
+            (
+                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                * self.hidden_size_per_attention_head
+            ),
+        )
+        mixed_qkv = mixed_qkv.view(*new_tensor_shape)
+
+        split_arg_list = [
+            (
+                self.num_attention_heads_per_partition
+                // self.num_query_groups_per_partition
+                * self.hidden_size_per_attention_head
+            ),
+            self.hidden_size_per_attention_head,
+            self.hidden_size_per_attention_head,
+        ]
+
+        # Return unsplit mixed_qkv and split_arg_list
+        if not split_qkv:
+            return mixed_qkv, split_arg_list
+
+        if SplitAlongDim is not None:
+
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+        else:
+
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+
+        # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        if self.q_layernorm is not None:
+            query = self.q_layernorm(query)
+
+        if self.k_layernorm is not None:
+            key = self.k_layernorm(key)
+
+        if self.config.test_mode:
+            self.run_realtime_tests()
+
+        return query, key, value
+
+    def backward_dw(self) -> NoReturn:
+        """Execute weight update operations"""
+        self._backward_qkv_proj()
+        self._backward_output_proj()
+
+    def _backward_qkv_proj(self):
+        """Update weights for QKV projection layer"""
+        self.linear_qkv.backward_dw()
+
+    def _backward_output_proj(self):
+        """Update weights for output projection layer"""
+        self.linear_proj.backward_dw()
+
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        set_save_original_input(self.linear_qkv)
+
+    def forward_qkv(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+    ) -> SelfAttention2ForwardState:
+        """Prepare the QKV tensors and metadata for fine-grained execution."""
+
+        state = SelfAttention2ForwardState(
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        state.inference_context = inference_context
+        state.in_decode_mode = (
+            inference_context is not None and inference_context.is_decode_only() and not self.training
+        )
+
+        no_rope = (
+            self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
+        )
+        if no_rope:
+            rotary_pos_emb = None
+
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = (rotary_pos_emb,) * 2
+        state.rotary_pos_emb = rotary_pos_emb
+
+        nvtx_range_push(suffix="qkv")
+        split_qkv = (self.attention_type == "cross") or not all(
+            [
+                not self.config.test_mode,
+                self.config.fused_single_qkv_rope,
+                inference_context is None,
+                packed_seq_params is None,
+                (
+                    rotary_pos_emb is not None
+                    and rotary_pos_emb[0] is not None
+                    and rotary_pos_emb[1] is not None
+                ),
+                not self.config.flash_decode,
+                HAVE_FUSED_QKV_ROPE,
+                self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
+                self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
+            ]
+        )
+        state.split_qkv = split_qkv
+
+        qkv_output = self.get_query_key_value_tensors(
+            hidden_states, key_value_states, split_qkv=split_qkv
+        )
+        if split_qkv:
+            state.query, state.key, state.value = qkv_output
+        else:
+            mixed_qkv, qkv_split_arg_list = qkv_output
+            state.mixed_qkv = mixed_qkv
+            state.qkv_split_arg_list = qkv_split_arg_list
+        nvtx_range_pop(suffix="qkv")
+
+        state.attn_mask_type = self.attn_mask_type
+        return state
+
+    def forward_core(self, state: SelfAttention2ForwardState) -> SelfAttention2ForwardState:
+        """Run the core attention computation (decode fastpath, kv cache adj, rotary, attn)."""
+
+        # Early exit if decode fastpath already produced output
+        if state.output_with_bias is not None:
+            return state
+
+        attention_mask = state.attention_mask
+        attention_bias = state.attention_bias
+        packed_seq_params = state.packed_seq_params
+        inference_context = state.inference_context
+        rotary_pos_emb = state.rotary_pos_emb
+        rotary_pos_cos = state.rotary_pos_cos
+        rotary_pos_sin = state.rotary_pos_sin
+        rotary_pos_cos_sin = state.rotary_pos_cos_sin
+        sequence_len_offset = state.sequence_len_offset
+
+        query, key, value = state.query, state.key, state.value
+        mixed_qkv = state.mixed_qkv
+        qkv_split_arg_list = state.qkv_split_arg_list
+        split_qkv = state.split_qkv
+
+        nvtx_range_push(suffix="adjust_key_value")
+        if state.in_decode_mode and self.config.flash_decode:
+            assert inference_context is not None
+            assert self.layer_number in inference_context.key_value_memory_dict
+            assert inference_context.sequence_len_offset is not None
+            inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
+                self.layer_number
+            ]
+            output = self.flash_decode(
+                sequence_len_offset=sequence_len_offset,
+                query_layer=query,
+                key_layer=key,
+                value_layer=value,
+                inference_key_memory=inference_key_memory,
+                inference_value_memory=inference_value_memory,
+                rotary_cos=rotary_pos_cos,
+                rotary_sin=rotary_pos_sin,
+                rotary_interleaved=self.config.rotary_interleaved,
+            )
+            out = output.transpose(0, 1).contiguous()
+            context_layer = out.view(out.size(0), out.size(1), -1)
+            state.output_with_bias = self.linear_proj(context_layer)
+            nvtx_range_pop(suffix="adjust_key_value")
+            return state
+
+        if (
+            state.in_decode_mode
+            and self.config.enable_cuda_graph
+            and self.config.cuda_graph_scope != "full_iteration"
+            and inference_context is not None
+            and inference_context.is_static_batching()
+        ):
+            nvtx_range_pop(suffix="adjust_key_value")
+            raise ValueError("CUDA graphs must use flash decode with static batching!")
+
+        if split_qkv:
+            query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
+                self._adjust_key_value_for_inference(
+                    inference_context,
+                    query,
+                    key,
+                    value,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    rotary_pos_cos_sin,
+                    sequence_len_offset,
+                )
+            )
+        else:
+            attn_mask_type = state.attn_mask_type
+            block_table = None
+
+        if packed_seq_params is not None:
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            value = value.squeeze(1)
+        nvtx_range_pop(suffix="adjust_key_value")
+
+        # Rotary embeddings
+        nvtx_range_push(suffix="rotary_pos_emb")
+        if rotary_pos_emb is not None and (
+            not self.config.flash_decode or inference_context is None
+        ):
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+
+            if packed_seq_params is not None:
+                if packed_seq_params.cu_seqlens_q_padded is not None:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+                else:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                if packed_seq_params.cu_seqlens_kv_padded is not None:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+                else:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            else:
+                cu_seqlens_q = cu_seqlens_kv = None
+
+            if split_qkv:
+                if q_pos_emb is not None:
+                    if inference_context is None or inference_context.is_static_batching():
+                        query = apply_rotary_pos_emb(
+                            query,
+                            q_pos_emb,
+                            config=self.config,
+                            cu_seqlens=cu_seqlens_q,
+                            mscale=_yarn_get_concentration_factor_from_config(self.config),
+                            cp_group=self.pg_collection.cp,
+                        )
+                    else:
+                        query = inference_context.apply_rotary_emb_query(
+                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+                        )
+                if k_pos_emb is not None:
+                    key = apply_rotary_pos_emb(
+                        key,
+                        k_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_kv,
+                        mscale=_yarn_get_concentration_factor_from_config(self.config),
+                        cp_group=self.pg_collection.cp,
+                    )
+            else:
+                assert mixed_qkv is not None and qkv_split_arg_list is not None
+                query, key, value = apply_fused_qkv_rotary_pos_emb(
+                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                )
+        nvtx_range_pop(suffix="rotary_pos_emb")
+
+        # Core attention
+        nvtx_range_push(suffix="core_attention")
+        if self.checkpoint_core_attention and self.training:
+            core_attn_out = self._checkpointed_attention_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            if inference_context is None or inference_context.is_static_batching():
+                core_attn_out = self.core_attention(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                )
+            else:
+                q, k, v = (query, key, value)
+                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+
+                core_attn_out = self.flash_decode_and_prefill(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_query_lengths,
+                    cu_kv_lengths,
+                    kv_lengths,
+                    block_table,
+                )
+                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        nvtx_range_pop(suffix="core_attention")
+
+        state.block_table = block_table
+        state.core_attn_out = core_attn_out
+        state.query, state.key, state.value = query, key, value
+        state.attn_mask_type = attn_mask_type
+        state.rotary_pos_emb = rotary_pos_emb
+        return state
+
+    def forward_out(self, state: SelfAttention2ForwardState) -> Tuple[Tensor, Tensor]:
+        """Project the attention output back to hidden size."""
+
+        if state.output_with_bias is None:
+            nvtx_range_push(suffix="linear_proj")
+            output, bias = self.linear_proj(state.core_attn_out)
+            nvtx_range_pop(suffix="linear_proj")
+            state.output_with_bias = (output, bias)
+        return state.output_with_bias
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Fine-grained forward broken into QKV, core attention, and projection helpers."""
+
+        state = self.forward_qkv(
+            hidden_states,
+            attention_mask,
+            key_value_states=key_value_states,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+        )
+        state = self.forward_core(state)
+        output, bias = self.forward_out(state)
+        return output, bias
+
+    def _backward_qkv_proj(self):
+        """Update weights for QKV projection layer."""
+
+        self.linear_qkv.backward_dw()
+
+    def _backward_output_proj(self):
+        """Update weights for output projection layer."""
+
+        self.linear_proj.backward_dw()
+
+    def backward_dw(self):
+        """Execute weight-gradient computations for both projection layers."""
+
+        self._backward_qkv_proj()
+        self._backward_output_proj()
+
 
 
 class CrossAttention(Attention):

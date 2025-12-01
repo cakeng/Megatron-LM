@@ -6,7 +6,11 @@ from typing import Optional, Union
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.attention import (
+    SelfAttention,
+    SelfAttention2,
+    SelfAttentionSubmodules,
+)
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -29,6 +33,7 @@ from megatron.core.transformer.transformer_block import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
+    TransformerLayer2,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
@@ -80,6 +85,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
+    fine_grained_attn: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -104,6 +110,12 @@ def get_gpt_layer_with_transformer_engine_spec(
             'The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated'
             " and will be removed soon. Please update your code accordingly."
         )
+
+    if fine_grained_attn and multi_latent_attention:
+        raise ValueError("fine_grained_attn is not supported with multi_latent_attention.")
+
+    if fine_grained_attn and multi_latent_attention:
+        raise ValueError("fine_grained_attn is not supported with multi_latent_attention.")
 
     if use_kitchen:
         assert HAVE_KITCHEN
@@ -163,11 +175,13 @@ def get_gpt_layer_with_transformer_engine_spec(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
+        layer_cls = TransformerLayer2 if fine_grained_attn else TransformerLayer
+        attn_cls = SelfAttention2 if fine_grained_attn else SelfAttention
         return ModuleSpec(
-            module=TransformerLayer,
+            module=layer_cls,
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
-                    module=SelfAttention,
+                    module=attn_cls,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=backend.column_parallel_layer_norm_linear(),
@@ -207,6 +221,7 @@ def get_gpt_layer_local_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
+    fine_grained_attn: bool = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -278,12 +293,14 @@ def get_gpt_layer_local_spec(
             ),
         )
     else:
+        layer_cls = TransformerLayer2 if fine_grained_attn else TransformerLayer
+        attn_cls = SelfAttention2 if fine_grained_attn else SelfAttention
         return ModuleSpec(
-            module=TransformerLayer,
+            module=layer_cls,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=layer_norm,
                 self_attention=ModuleSpec(
-                    module=SelfAttention,
+                    module=attn_cls,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=backend.column_parallel_linear(),
@@ -421,6 +438,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            fine_grained_attn=config.fine_grained_attn,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -431,6 +449,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            fine_grained_attn=config.fine_grained_attn,
         )
     else:
         layer_norm_impl = LNImpl
@@ -443,6 +462,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            fine_grained_attn=config.fine_grained_attn,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -453,6 +473,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            fine_grained_attn=config.fine_grained_attn,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

@@ -202,6 +202,10 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    fine_grained_attn: bool = False
+    """If True, build TransformerLayer2 + SelfAttention2 so the scheduler can split
+    attention into QKV/core/output chunks."""
+
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
     An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,

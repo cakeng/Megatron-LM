@@ -1046,6 +1046,9 @@ def forward_backward_pipelining_with_interleaving(
         num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
     )
 
+    # print(f"//// SCHEDULE TABLE //// {schedule_table} //// SCHEDULE TABLE ////")
+
+
     # Decouple individual lookup table for microbatch_id and model_chunk_id.
     # For example, the micro-batch table for PP2 N3M5 with VP2 is
     # virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9

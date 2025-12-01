@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import weakref
 from contextlib import nullcontext
 from functools import partial
@@ -15,7 +16,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
 )
-from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayer2, make_viewless_tensor
 
 
 def weak_method(method):
@@ -196,6 +197,397 @@ class PostProcessNode(ScheduleNode):
         return float16_to_fp32(loss)
 
 
+class TransformerLayerNode2(ScheduleNode):
+    """Base class for transformer layer computation nodes.
+
+    This class provides common functionality for different types of
+    transformer layer nodes (attention, MLP, etc.)
+    """
+
+    def __init__(
+        self,
+        stream,
+        event,
+        layer_state,
+        chunk_state,
+        submodule,
+        name="default",
+        bwd_dw_callables=None,
+        extra_args={},
+    ):
+        """Initialize a transformer layer node.
+
+        Args:
+            stream (torch.cuda.Stream): CUDA stream for execution
+            event (torch.cuda.Event): Synchronization event
+            layer_state (TransformerLayerState): State shared within a layer
+            chunk_state (TransformerChunkState): State shared within a chunk
+            submodule (function): The submodule contain forward and dw function
+            it's the per_batch_state_context, o.w. nullcontext
+            name (str): Node name, also used to determine memory strategy
+            bwd_dw_callables (list): List of weight gradient functions for the layer.
+            extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
+        """
+        # print ("//// USING TransformerLayerNode2 ////")
+        # determine whether to free input memory
+        is_moe = extra_args.get("is_moe", False)
+        enable_deepep = extra_args.get("enable_deepep", False)
+        free_input = should_free_input(name, is_moe, enable_deepep)
+        self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
+
+        super().__init__(
+            weak_method(self.forward_impl),
+            stream,
+            event,
+            weak_method(self.backward_impl),
+            free_input=free_input,
+            name=name,
+        )
+        self.layer_state = layer_state
+        self.chunk_state = chunk_state
+        self.submodule = submodule
+        self.detached = tuple()
+        self.before_detached = tuple()
+
+        # Create flags to indicate first and last layer
+        self.is_first_layer = extra_args.get("is_first_layer", False)
+        self.is_last_layer = extra_args.get("is_last_layer", False)
+
+        # Initialize list to store registered dw callables
+        self.bwd_dw_callables = []
+        if bwd_dw_callables is not None:
+            self.bwd_dw_callables = (
+                bwd_dw_callables if isinstance(bwd_dw_callables, list) else [bwd_dw_callables]
+            )
+
+    def detach(self, t):
+        """Detaches a tensor and stores it for backward computation."""
+        detached = make_viewless(t).detach()
+        detached.requires_grad = t.requires_grad
+        self.before_detached = self.before_detached + (t,)
+        self.detached = self.detached + (detached,)
+        return detached
+
+    def forward_impl(self, *args):
+        """Calls the submodule as the forward pass."""
+        return self.submodule(self, *args)
+
+    def backward_impl(self, outputs, output_grad):
+        """Implements the backward pass for the transformer layer node."""
+        debug_detach = False
+        detached_grad_entries = []
+        for idx, e in enumerate(self.detached):
+            grad = e.grad
+            if grad is None:
+                if debug_detach:
+                    print(
+                        f"[FineGrainedDetaches] node={self.name} idx={idx} shape={tuple(e.shape)} requires_grad={e.requires_grad} grad_is_none=True",
+                        flush=True,
+                    )
+                grad = torch.zeros_like(e)
+            detached_grad_entries.append(grad)
+        detached_grad = tuple(detached_grad_entries)
+        grads = output_grad + detached_grad
+        self.default_backward_func(outputs + self.before_detached, grads)
+        self._release_state()
+        # return grads for record stream
+        return grads
+
+    def backward_dw(self):
+        """Computes the weight gradients for the transformer layer node."""
+        if not self.delay_wgrad_compute:
+            return
+        with torch.cuda.nvtx.range(f"{self.name} wgrad"):
+            for module in self.bwd_dw_callables:
+                module.backward_dw()
+        self.bwd_dw_callables = None
+
+    def _release_state(self):
+        # Release reference as early as possible, this helps avoid memory leak.
+        self.before_detached = None
+        self.detached = None
+        self.layer_state = None
+        self.chunk_state = None
+        self.submodule = None
+
+def build_transformer_layer_callables2(layer: TransformerLayer2):
+    """Create callables for transformer layer nodes.
+    Divides the transformer layer's operations into a sequence of smaller, independent
+    functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
+    MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
+
+    The five callables are:
+    1. Attention (computation)
+    2. Post-Attention (computation)
+    3. MoE Dispatch (communication)
+    4. MLP / MoE Experts (computation)
+    5. MoE Combine (communication)
+
+    By assigning these functions to different CUDA streams (e.g., a compute stream
+    and a communication stream), the scheduler can overlap their execution, preventing
+    tasks from competing for resources and hiding communication latency by running them
+    in parallel with functions from other micro-batches.
+
+    Args:
+        layer: The transformer layer to build callables for.
+
+    Returns:
+        A tuple containing:
+        - forward_funcs: List of callable functions for the layer
+        - backward_dw: Dict of weight gradient functions for the layer
+    """
+
+    is_moe = isinstance(layer.mlp, MoELayer)
+    enable_deepep = layer.config.moe_enable_deepep
+
+    def _get_chunk_state_attr(chunk_state, attr_name, default=None):
+        return getattr(chunk_state, attr_name, default)
+
+    def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """
+        Performs same attnention forward logic as GPT Model.
+        """
+        hidden_states, _ = layer._forward_attention(
+            hidden_states=hidden_states,
+            attention_mask=node.chunk_state.attention_mask,
+            rotary_pos_emb=node.chunk_state.rotary_pos_emb,
+            rotary_pos_cos=node.chunk_state.rotary_pos_cos,
+            rotary_pos_sin=node.chunk_state.rotary_pos_sin,
+            packed_seq_params=node.chunk_state.packed_seq_params,
+            sequence_len_offset=node.chunk_state.sequence_len_offset,
+        )
+        return hidden_states
+
+    def submodule_attn_qkv_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """Runs only the QKV preparation portion of self-attention."""
+
+        chunk_state = node.chunk_state
+
+        if layer.recompute_input_layernorm:
+            layer.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            input_layernorm_output = layer.input_layernorm_checkpoint.checkpoint(
+                layer.input_layernorm, hidden_states
+            )
+        else:
+            input_layernorm_output = layer.input_layernorm(hidden_states)
+
+        state = layer.self_attention_forward_qkv(
+            input_layernorm_output,
+            attention_mask=chunk_state.attention_mask,
+            key_value_states=_get_chunk_state_attr(chunk_state, "context", None),
+            inference_context=_get_chunk_state_attr(chunk_state, "inference_context", None),
+            rotary_pos_emb=chunk_state.rotary_pos_emb,
+            rotary_pos_cos=chunk_state.rotary_pos_cos,
+            rotary_pos_sin=chunk_state.rotary_pos_sin,
+            attention_bias=_get_chunk_state_attr(chunk_state, "attention_bias", None),
+            packed_seq_params=chunk_state.packed_seq_params,
+            sequence_len_offset=chunk_state.sequence_len_offset,
+        )
+
+        node.layer_state.attn_state = state
+        return hidden_states
+
+    def submodule_attn_core_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """Runs the core attention (FlashAttention) stage."""
+
+        state = getattr(node.layer_state, "attn_state", None)
+        assert state is not None, "Missing attention state for attn_core chunk."
+        state = layer.self_attention_forward_core(state)
+        node.layer_state.attn_state = state
+        return hidden_states
+
+    def submodule_attn_out_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """Applies the output projection and bias-dropout-add."""
+
+        residual = (
+            node.detach(hidden_states) if hidden_states.requires_grad else hidden_states
+        )
+
+        state = getattr(node.layer_state, "attn_state", None)
+        assert state is not None, "Missing attention state for attn_out chunk."
+
+        attention_output_with_bias = layer.self_attention_forward_out(state)
+
+        if layer.recompute_input_layernorm:
+            layer.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
+
+        with layer.bias_dropout_add_exec_handler():
+            hidden_states = layer.self_attn_bda(layer.training, layer.config.bias_dropout_fusion)(
+                attention_output_with_bias, residual, layer.hidden_dropout
+            )
+        hidden_states = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        node.layer_state.attn_state = None
+        return hidden_states
+
+    def submodule_post_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+        """
+        Run forward pass for computations between attention and dispatch:
+            pre mlp layernorm->router->dispatch preprocess
+        """
+        if layer.recompute_pre_mlp_layernorm:
+            layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                layer.pre_mlp_layernorm, hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+
+        local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
+
+        if hidden_states.requires_grad:
+            node.layer_state.residual = node.detach(hidden_states)
+        else:
+            node.layer_state.residual = hidden_states
+        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
+            if pre_mlp_layernorm_output.requires_grad:
+                node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
+            else:
+                node.layer_state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
+
+        return local_tokens, probs
+
+    def submodule_dispatch_forward(
+        node: ScheduleNode, local_tokens: torch.Tensor, probs: torch.Tensor
+    ):
+        """
+        Dispatches tokens to the experts based on the router output.
+        """
+        token_dispatcher = layer.mlp.token_dispatcher
+        if enable_deepep:
+            # update token_probs to be the detached version, prevents
+            # backward graph from connecting to attn submodule
+            token_dispatcher._comm_manager.token_probs = probs
+
+        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+        if dispatched_probs.requires_grad:
+            node.layer_state.dispatched_probs = node.detach(dispatched_probs)
+        else:
+            node.layer_state.dispatched_probs = dispatched_probs
+        return dispatched_tokens
+
+    def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
+        """
+        Run forward pass for computations between dispatch and combine:
+            post dispatch->experts->combine preprocess
+        """
+        shared_expert_output = None
+        dispatched_probs = node.layer_state.dispatched_probs
+        token_dispatcher = layer.mlp.token_dispatcher
+        if enable_deepep:
+            # update dispatched_probs to be detached version, prevents
+            # backward graph from connecting to dispatch submodule
+            token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
+
+        pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
+        expert_output, shared_expert_output, mlp_bias = layer.mlp.experts_compute(
+            dispatched_tokens, dispatched_probs, pre_mlp_layernorm_output
+        )
+
+        if layer.recompute_pre_mlp_layernorm:
+            # discard the output of the pre-mlp layernorm and register the recompute
+            # as a gradient hook of expert_output
+            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
+        # release tensor reference after use
+        node.layer_state.dispatched_probs = None
+        node.layer_state.pre_mlp_layernorm_output = None
+        if shared_expert_output is None:
+            # Return only expert_output, since shared_expert_output causes backward on None
+            return expert_output
+        return expert_output, shared_expert_output
+
+    def submodule_combine_forward(
+        node: ScheduleNode,
+        output: torch.Tensor,
+        shared_expert_output: Optional[torch.Tensor] = None,
+    ):
+        """
+        # Triggers token combine and the remaining computation in the transformer layer.
+        # The `mlp_bda` computation is placed after `mlp.combine` due to data dependency.
+        # This ordering is also critical for pipeline performance. Starting the `mlp.combine`
+        # communication at first allows it to be overlapped with computation from another
+        # microbatch. If `mlp_bda` were to run first, it would compete for SM resources
+        # with another microbatch's computation and expose the communication.
+        """
+        residual = node.layer_state.residual
+
+        output = layer.mlp.combine(output, shared_expert_output)
+        mlp_output_with_bias = (output, None)
+
+        with layer.bias_dropout_add_exec_handler():
+            hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
+                mlp_output_with_bias, residual, layer.hidden_dropout
+            )
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        # Need to record residual to comm stream, since it's created on comp stream
+        node.layer_state.residual.record_stream(torch.cuda.current_stream())
+
+        # release tensor reference after use
+        node.layer_state.residual = None
+        return output
+
+    def mlp_wrapper(node: ScheduleNode, *args, **kwargs):
+        """Wrapper for Dense forward."""
+        return layer._forward_mlp(*args, **kwargs)
+
+    def raise_not_implemented(*args):
+        """Raise NotImplementedError for Dense layer."""
+        raise NotImplementedError("This callable is not implemented for Dense layer.")
+
+    # Build forward and backward callable functions
+    use_fine_grained_attn = (
+        hasattr(layer, "supports_fine_grained_attn") and layer.supports_fine_grained_attn()
+    )
+
+    attn_functions = []
+    backward_dw = {}
+
+    if use_fine_grained_attn:
+        attn_functions.extend(
+            [
+                submodule_attn_qkv_forward,
+                submodule_attn_core_forward,
+                submodule_attn_out_forward,
+            ]
+        )
+        class _BackwardWrapper:
+            def __init__(self, fn, fallback):
+                self._fn = fn
+                self._fallback = fallback
+
+            def backward_dw(self):
+                if self._fn is not None:
+                    self._fn()
+                else:
+                    self._fallback.backward_dw()
+
+        qkv_dw_fn = getattr(layer.self_attention, "_backward_qkv_proj", None)
+        out_dw_fn = getattr(layer.self_attention, "_backward_output_proj", None)
+        backward_dw["attn_qkv"] = _BackwardWrapper(qkv_dw_fn, layer.self_attention)
+        backward_dw["attn_out"] = _BackwardWrapper(out_dw_fn, layer.self_attention)
+    else:
+        attn_functions.append(submodule_attn_forward)
+        backward_dw["attn"] = layer.self_attention
+
+    post_attn_func = submodule_post_attn_forward if is_moe else raise_not_implemented
+    dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
+    mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
+    combine_func = submodule_combine_forward if is_moe else raise_not_implemented
+
+    forward_funcs = (
+        attn_functions + [post_attn_func, dispatch_func, mlp_func, combine_func, None]
+    )
+    backward_dw["mlp"] = layer.mlp
+    return forward_funcs, backward_dw
+
+
 class TransformerLayerNode(ScheduleNode):
     """Base class for transformer layer computation nodes.
 
@@ -295,7 +687,6 @@ class TransformerLayerNode(ScheduleNode):
         self.layer_state = None
         self.chunk_state = None
         self.submodule = None
-
 
 def build_transformer_layer_callables(layer: TransformerLayer):
     """Create callables for transformer layer nodes.
@@ -576,6 +967,8 @@ def build_layer_callables(layer):
         forward_funcs: list of callable functions for the layer.
         backward_dw: dict of weight gradient functions for the layer.
     """
+    if isinstance(layer, TransformerLayer2):
+        return build_transformer_layer_callables2(layer)
     if isinstance(layer, TransformerLayer):
         return build_transformer_layer_callables(layer)
     elif isinstance(layer, MultiTokenPredictionLayer):
